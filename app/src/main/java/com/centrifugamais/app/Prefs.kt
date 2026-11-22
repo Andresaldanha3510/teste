@@ -25,31 +25,6 @@ class Prefs(context: Context) {
         get() = sp.getInt("spinSpeed", -1)
         set(v) = sp.edit().putInt("spinSpeed", v).apply()
 
-    var spinTime: Int
-        get() = sp.getInt("spinTime", -1)
-        set(v) = sp.edit().putInt("spinTime", v).apply()
-
-    /**
-     * What each spin-time level turned out to be on this machine: level -> minutes,
-     * or -1 when the machine refused that level.
-     */
-    var spinLevels: Map<Int, Int>
-        get() = (sp.getString("spinLevels", "") ?: "").split(',').mapNotNull { e ->
-            val parts = e.split(':')
-            if (parts.size == 2) parts[0].toIntOrNull()?.let { k -> parts[1].toIntOrNull()?.let { k to it } } else null
-        }.toMap()
-        set(v) = sp.edit().putString("spinLevels", v.entries.joinToString(",") { "${it.key}:${it.value}" }).apply()
-
-    /**
-     * Version 0.2.0 could wrongly learn "refused" when it resumed a paused cycle;
-     * drop those entries once.
-     */
-    fun migrateSpinLevels() {
-        if (sp.getBoolean("levelsMigrated3", false)) return
-        spinLevels = spinLevels.filterValues { it >= 0 }
-        sp.edit().putBoolean("levelsMigrated3", true).apply()
-    }
-
     var device: SavedDevice?
         get() {
             if (!sp.contains("dev_id")) return null

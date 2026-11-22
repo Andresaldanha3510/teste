@@ -70,7 +70,22 @@ class ProtocolVectorsTest {
 
     @Test fun frontLoadSpinOnly() {
         val status = FrontLoadWasher.parse(ByteArray(32).also { it[1] = 1 })!!
-        assertEquals(db_spin, AaFrame.build(0xDB, 2, AaFrame.TYPE_SET, FrontLoadWasher.spinOnlyBody(status, 12, 6)).toHex())
+        assertEquals(
+            "aa1adb0000000000000202ff010009ffffff06ffffffffffffff02",
+            AaFrame.build(0xDB, 0, AaFrame.TYPE_SET, FrontLoadWasher.spinOnlyBody(status, 6)).toHex(),
+        )
+    }
+
+    @Test fun frontLoadPrograms() {
+        val status = FrontLoadWasher.parse(ByteArray(32).also { it[1] = 1 })!!
+        assertEquals(
+            "aa1adb0000000000000202ff01000affffffffffffffffffffff08",
+            AaFrame.build(0xDB, 0, AaFrame.TYPE_SET, FrontLoadWasher.programBody(status, 0x0A, null, null)).toHex(),
+        )
+        assertEquals(
+            "aa1adb0000000000000202ff010000ffff0405ffffffffffffff07",
+            AaFrame.build(0xDB, 0, AaFrame.TYPE_SET, FrontLoadWasher.programBody(status, 0x00, 5, 4)).toHex(),
+        )
     }
 
     @Test fun cloudHelpers() {

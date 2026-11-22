@@ -30,12 +30,10 @@ class RealMachineTest {
         assertEquals(10, s.spinMinutes)
     }
 
-    @Test fun spinCommandMatchesWhatTheMachineAccepted() {
+    @Test fun spinCommandKeepsAcceptedFields() {
+        // On the real machine the frame with program 0x09 + speed 6 started a 1400 rpm spin.
         val status = FrontLoadWasher.parse(standby.hexToBytes())!!
-        // Same frame the app sent in the real test, with level 17.
-        assertEquals(
-            "aa1adb0000000000000202ff010009ffffff06ff11fffffffffff0",
-            AaFrame.build(0xDB, 0, AaFrame.TYPE_SET, FrontLoadWasher.spinOnlyBody(status, 17, 6)).toHex(),
-        )
+        val frame = AaFrame.build(0xDB, 0, AaFrame.TYPE_SET, FrontLoadWasher.spinOnlyBody(status, 6)).toHex()
+        assertEquals("aa1adb0000000000000202ff010009ffffff06ffffffffffffff02", frame)
     }
 }

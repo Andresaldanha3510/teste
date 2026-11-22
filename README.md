@@ -1,9 +1,12 @@
 # Centrifuga+
 
-App Android para controlar a centrifugação de lavadoras Midea com Wi-Fi (app **SmartHome**)
-pela rede local: centrifugar agora com tempo e velocidade escolhidos, iniciar o programa do
-painel com centrifugação reforçada e repetir a centrifugação automaticamente quando o ciclo
-terminar.
+App Android para controlar lavadoras Midea com Wi-Fi (app **SmartHome**) pela rede local:
+
+- programas da máquina em botões, com temperatura, velocidade e centrifugação extra no final;
+- especiais: centrifugar 1, 2 ou 3 vezes, enxágue + centrifugação (e + centrifugar de novo);
+- sequências: o app inicia a próxima etapa sozinho quando o ciclo termina;
+- centrifugação extra depois de um ciclo iniciado no painel;
+- o app aprende quais programas a máquina tem (os que aparecem no status dela).
 
 ## Baixar o APK
 

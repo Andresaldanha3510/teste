@@ -16,7 +16,7 @@ data class WasherStatus(
     val spinTimeValue: Int,
     /** Spin duration in minutes as reported by the machine, when it reports it. */
     val spinMinutes: Int?,
-    /** Total cycle time remaining is in [timeRemainingMin]; this is the wash part only. */
+    /** Wash duration in minutes as reported by the machine, when it reports it. */
     val washMinutes: Int?,
     val errorCode: Int,
     val rawBody: ByteArray,
@@ -31,22 +31,31 @@ data class Option(val code: Int, val label: String)
 sealed class WasherModel(val deviceType: Int) {
     abstract val familyName: String
     abstract val spinSpeeds: List<Option>
-    abstract val maxSpinTime: Int
-    abstract val spinTimeUnit: String
-    abstract val defaultSpinTime: Int
-    /** True when the machine has a dedicated spin-only program. */
-    abstract val hasSpinOnlyProgram: Boolean
+    /** Empty when the protocol has no temperature setting for this family. */
+    abstract val temperatures: List<Option>
+    /** Program catalog known from the protocol (not every machine has all of them). */
+    abstract val programs: List<Option>
+    /** Dedicated spin-only program code, or null if the family has none. */
+    abstract val spinOnlyProgram: Int?
+    /** Rinse + spin program code, or null if the family has none. */
+    abstract val rinseSpinProgram: Int?
+    val hasSpinOnlyProgram: Boolean get() = spinOnlyProgram != null
 
     fun queryBody(): ByteArray = bytesOf(0x03)
     abstract fun powerBody(on: Boolean): ByteArray
     fun pauseBody(): ByteArray = bytesOf(0x02, 0xFF, 0x00)
     abstract fun parse(body: ByteArray): WasherStatus?
 
-    /** Starts the program currently selected on the machine, overriding spin settings. */
-    abstract fun startCurrentProgramBody(status: WasherStatus, spinTime: Int, spinSpeed: Int): ByteArray
+    abstract fun programName(code: Int): String
 
-    /** Starts a spin-only cycle. */
-    abstract fun spinOnlyBody(status: WasherStatus, spinTime: Int, spinSpeed: Int): ByteArray
+    /**
+     * Starts [program]. Null settings mean "the program's default" (0xFF), which is
+     * what the machine uses when its own app leaves a setting untouched.
+     */
+    abstract fun programBody(status: WasherStatus, program: Int, spinSpeed: Int?, temperature: Int?): ByteArray
+
+    /** Starts a spin-only cycle at [spinSpeed]. */
+    abstract fun spinOnlyBody(status: WasherStatus, spinSpeed: Int): ByteArray
 
     companion object {
         const val TYPE_TOP_LOAD = 0xDA
@@ -71,17 +80,18 @@ private fun stageFromBits(bits: Int, firstBit: Int, lastBit: Int, offset: Int): 
 object TopLoadWasher : WasherModel(TYPE_TOP_LOAD) {
     override val familyName = "Abertura superior (0xDA)"
     override val spinSpeeds = listOf(Option(1, "Baixa"), Option(2, "Média"), Option(3, "Alta"))
-    override val maxSpinTime = 15
-    override val spinTimeUnit = "min"
-    override val defaultSpinTime = 9
-    override val hasSpinOnlyProgram = false
-
-    private val programs = listOf(
+    override val temperatures = emptyList<Option>()
+    override val programs = listOf(
         "Normal", "Rápido", "Edredom", "Lã", "Enxágue", "Memória", "Infantil", "Jaqueta",
         "Mexer", "Silencioso", "Limpeza do cesto", "Secagem a ar",
-    )
+    ).mapIndexed { i, name -> Option(i, name) }
+    override val spinOnlyProgram: Int? = null
+    override val rinseSpinProgram: Int? = null
+
     private val stages = listOf("Parada", "Centrifugando", "Enxaguando", "Lavando", "Pesando", "—", "Secando", "De molho")
     private val speeds = listOf("—", "Baixa", "Média", "Alta")
+
+    override fun programName(code: Int) = programs.getOrNull(code)?.label ?: "Programa $code"
 
     override fun powerBody(on: Boolean) = bytesOf(0x02, if (on) 1 else 0, 0xFF)
 
@@ -104,7 +114,7 @@ object TopLoadWasher : WasherModel(TYPE_TOP_LOAD) {
             },
             finished = power && !running && stage == 0,
             programCode = program,
-            programName = programs.getOrElse(program) { "Programa $program" },
+            programName = programName(program),
             stageName = stages.getOrElse(stage) { "—" },
             timeRemainingMin = if (power) body.at(17) + body.at(18) * 60 else null,
             spinSpeedCode = speed,
@@ -131,20 +141,21 @@ object TopLoadWasher : WasherModel(TYPE_TOP_LOAD) {
         return d
     }
 
-    private fun withSpin(d: ByteArray, spinTime: Int, spinSpeed: Int) {
+    private fun setSpeed(d: ByteArray, spinSpeed: Int) {
         d[3] = (((spinSpeed and 0x0F) shl 4) or (d[3].toInt() and 0x0F)).toByte()
-        d[7] = (((spinTime and 0x0F) shl 4) or (d[7].toInt() and 0x0F)).toByte()
     }
 
-    override fun startCurrentProgramBody(status: WasherStatus, spinTime: Int, spinSpeed: Int): ByteArray {
+    override fun programBody(status: WasherStatus, program: Int, spinSpeed: Int?, temperature: Int?): ByteArray {
         val d = washingData(status)
-        withSpin(d, spinTime, spinSpeed)
+        d[1] = program.toByte()
+        spinSpeed?.let { setSpeed(d, it) }
         return bytesOf(0x02, 0xFF, 0x01) + d
     }
 
-    override fun spinOnlyBody(status: WasherStatus, spinTime: Int, spinSpeed: Int): ByteArray {
+    /** Experimental: this family has no spin-only program, so wash and rinse are zeroed. */
+    override fun spinOnlyBody(status: WasherStatus, spinSpeed: Int): ByteArray {
         val d = washingData(status)
-        withSpin(d, spinTime, spinSpeed)
+        setSpeed(d, spinSpeed)
         d[6] = 0 // wash time
         d[7] = (d[7].toInt() and 0xF0).toByte() // rinse count = 0
         d[9] = 0 // soak time
@@ -159,25 +170,28 @@ object FrontLoadWasher : WasherModel(TYPE_FRONT_LOAD) {
         Option(1, "400 rpm"), Option(2, "600 rpm"), Option(3, "800 rpm"), Option(4, "1000 rpm"),
         Option(5, "1200 rpm"), Option(6, "1400 rpm"),
     )
-    // The spin-time field is a level, not minutes (confirmed on a real machine:
-    // level 2 = 10 min). The machine reports the real minutes in body[28].
-    override val maxSpinTime = 9
-    override val spinTimeUnit = "nível"
-    override val defaultSpinTime = 2
-    override val hasSpinOnlyProgram = true
+    override val temperatures = listOf(
+        Option(1, "Fria"), Option(2, "20 °C"), Option(3, "30 °C"), Option(4, "40 °C"), Option(5, "60 °C"), Option(6, "95 °C"),
+    )
+    override val spinOnlyProgram: Int = 0x09
+    override val rinseSpinProgram: Int = 0x0A
 
-    private const val PROGRAM_SPIN_ONLY = 0x09
-
-    private val programs = mapOf(
+    /** Codes from the midea-local program table, with Portuguese names. */
+    private val names = linkedMapOf(
         0x00 to "Algodão", 0x01 to "Eco", 0x02 to "Rápido", 0x03 to "Misto", 0x04 to "Sintéticos",
         0x05 to "Lã", 0x09 to "Só centrifugar", 0x0A to "Enxágue + centrifugação", 0x0B to "Volumosos",
-        0x0C to "Bebê", 0x0F to "Edredom/jaqueta", 0x10 to "Cores", 0x11 to "Inteligente",
-        0x12 to "Rápido", 0x13 to "Infantil", 0x1C to "Camisas", 0x26 to "Limpeza do tambor",
-        0x36 to "Jeans", 0x3F to "Toalhas", 0x66 to "Padrão", 0x73 to "Volumosos",
+        0x0C to "Roupas de bebê", 0x0F to "Edredom/jaqueta", 0x10 to "Cores", 0x11 to "Inteligente",
+        0x12 to "Lavagem rápida", 0x13 to "Infantil", 0x1C to "Camisas", 0x26 to "Limpeza do tambor",
+        0x2D to "Lavagem fria", 0x36 to "Jeans", 0x38 to "Seda", 0x3A to "Roupas de academia",
+        0x3F to "Toalhas", 0x66 to "Padrão", 0x6C to "Eco 40-60", 0x73 to "Volumosos",
     )
+    override val programs: List<Option> = names.filterKeys { it != 0x09 && it != 0x0A }.map { Option(it.key, it.value) }
+
     private val statuses = listOf("Desligada", "Em espera", "Funcionando", "Pausada", "Terminou", "Falha", "Início agendado")
     private val stages = listOf("Parada", "Centrifugando", "Enxaguando", "Lavando", "Pré-lavagem", "Secando", "Pesando", "Centrifugação alta", "—")
     private val speedNames = mapOf(0 to "Sem centrifugar", 1 to "400", 2 to "600", 3 to "800", 4 to "1000", 5 to "1200", 6 to "1400", 7 to "1600", 8 to "1300")
+
+    override fun programName(code: Int) = names[code] ?: "Programa 0x%02X".format(code)
 
     override fun powerBody(on: Boolean): ByteArray = bytesOf(0x02, if (on) 1 else 0) + ByteArray(20) { 0xFF.toByte() }
 
@@ -196,7 +210,7 @@ object FrontLoadWasher : WasherModel(TYPE_FRONT_LOAD) {
             statusText = if (!power) "Desligada" else statuses.getOrElse(state) { "Estado $state" },
             finished = power && state == 4,
             programCode = program,
-            programName = programs[program] ?: "Programa 0x%02X".format(program),
+            programName = programName(program),
             stageName = stages.getOrElse(stage) { "—" },
             timeRemainingMin = if (power) body.at(17) + (body.at(18) shl 8) else null,
             spinSpeedCode = speed,
@@ -209,34 +223,20 @@ object FrontLoadWasher : WasherModel(TYPE_FRONT_LOAD) {
         )
     }
 
-    private fun washingData(status: WasherStatus): ByteArray {
-        val b = status.rawBody
-        val d = ByteArray(13) { 0xFF.toByte() }
-        d[0] = b.at(3).toByte() // mode
-        d[1] = b.at(4).toByte() // program
-        d[2] = b.at(5).toByte() // water level
-        d[4] = b.at(7).toByte() // temperature
-        d[5] = b.at(8).toByte() // spin speed
-        d[6] = b.at(9).toByte() // wash time
-        d[7] = b.at(10).toByte() // spin time
-        d[8] = b.at(11).toByte() // detergent
-        d[9] = b.at(12).toByte() // softener
-        return d
-    }
-
-    override fun startCurrentProgramBody(status: WasherStatus, spinTime: Int, spinSpeed: Int): ByteArray {
-        val d = washingData(status)
-        d[5] = spinSpeed.toByte()
-        d[7] = spinTime.toByte()
-        return bytesOf(0x02, 0xFF, 0x01) + d
-    }
-
-    override fun spinOnlyBody(status: WasherStatus, spinTime: Int, spinSpeed: Int): ByteArray {
+    /**
+     * Washing data: [mode, program, water level, -, temperature, spin speed, wash time,
+     * spin time, detergent, softener, -, -, -]. 0xFF = program default.
+     */
+    override fun programBody(status: WasherStatus, program: Int, spinSpeed: Int?, temperature: Int?): ByteArray {
         val d = ByteArray(13) { 0xFF.toByte() }
         d[0] = 0x00 // normal mode
-        d[1] = PROGRAM_SPIN_ONLY.toByte()
-        d[5] = spinSpeed.toByte()
-        d[7] = spinTime.toByte()
+        d[1] = program.toByte()
+        temperature?.let { d[4] = it.toByte() }
+        spinSpeed?.let { d[5] = it.toByte() }
         return bytesOf(0x02, 0xFF, 0x01) + d
     }
+
+    /** The spin time is left at the machine default: on a real machine it is fixed (10 min). */
+    override fun spinOnlyBody(status: WasherStatus, spinSpeed: Int): ByteArray =
+        programBody(status, spinOnlyProgram, spinSpeed, null)
 }

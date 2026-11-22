@@ -22,11 +22,10 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.SeekBar
 import android.widget.Spinner
-import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import com.centrifugamais.midea.FrontLoadWasher
 import com.centrifugamais.midea.WasherModel
 
 class MainActivity : Activity() {
@@ -37,19 +36,18 @@ class MainActivity : Activity() {
     // Control screen views (null while on the setup screen)
     private var connText: TextView? = null
     private var statusText: TextView? = null
-    private var autoStatusText: TextView? = null
-    private var autoSwitch: Switch? = null
+    private var planText: TextView? = null
+    private var cancelPlanButton: Button? = null
+    private var programsBox: LinearLayout? = null
+    private var programsSignature = ""
     private var logText: TextView? = null
-    private var timeLabel: TextView? = null
 
     private var selectedSpeed = 0
-    private var selectedTime = 0
-    private var selectedRepeats = 1
+    private var followRepeats = 1
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
-        prefs.migrateSpinLevels()
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -157,7 +155,8 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------------ setup screen
 
     private fun showSetup() {
-        connText = null; statusText = null; autoStatusText = null; autoSwitch = null; logText = null
+        connText = null; statusText = null; planText = null; cancelPlanButton = null
+        programsBox = null; programsSignature = ""; logText = null
         val root = page()
         root.text("Centrifuga+", 26f, bold = true, color = "#1565C0")
         root.text("Controle a centrifugação da sua lavadora Midea pelo Wi-Fi.", 15f, color = "#555555")
@@ -209,83 +208,69 @@ class MainActivity : Activity() {
     private fun showControl(dev: SavedDevice) {
         val model = WasherModel.forType(dev.type) ?: return showSetup()
         WasherController.start(this, dev)
+        if (selectedSpeed == 0) {
+            selectedSpeed = prefs.spinSpeed.takeIf { s -> model.spinSpeeds.any { it.code == s } }
+                ?: model.spinSpeeds.last().code
+        }
 
         val root = page()
         root.text(dev.name, 24f, bold = true, color = "#1565C0")
         root.text(model.familyName + " · " + dev.ip, 13f, color = "#666666")
         connText = root.text("", 14f)
 
+        // ---- status + running sequence
         val st = root.card("Agora")
         statusText = st.text("Aguardando status…", 15f)
+        planText = st.text("", 14f, color = "#1565C0")
+        cancelPlanButton = st.button("Cancelar sequência", primary = false) { WasherController.cancelPlan() }
 
-        // ---- spin settings
-        val spin = root.card("Centrifugação")
-        if (selectedSpeed == 0) selectedSpeed = prefs.spinSpeed.takeIf { s -> model.spinSpeeds.any { it.code == s } }
-            ?: model.spinSpeeds.last().code
-        if (selectedTime <= 0) selectedTime = prefs.spinTime.takeIf { it in 1..model.maxSpinTime }
-            ?: model.defaultSpinTime
-        spin.text("Velocidade", 13f, color = "#666666")
-        spin.spinner(model.spinSpeeds.map { it.label }, model.spinSpeeds.indexOfFirst { it.code == selectedSpeed }) {
+        // ---- spin / rinse specials
+        val sp = root.card("Centrifugar e enxaguar")
+        sp.text("Velocidade da centrifugação", 13f, color = "#666666")
+        sp.spinner(model.spinSpeeds.map { it.label }, model.spinSpeeds.indexOfFirst { it.code == selectedSpeed }) {
             selectedSpeed = model.spinSpeeds[it].code
             prefs.spinSpeed = selectedSpeed
         }
-        timeLabel = spin.text("", 13f, color = "#666666")
-        val seek = SeekBar(this).apply {
-            max = model.maxSpinTime - 1
-            progress = selectedTime - 1
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    selectedTime = p + 1
-                    prefs.spinTime = selectedTime
-                    updateTimeLabel(model)
-                }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
-        }
-        spin.addView(seek, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        updateTimeLabel(model)
-
-        spin.button("Centrifugar agora" + if (model.hasSpinOnlyProgram) "" else " (experimental)") {
-            confirm("Centrifugar agora?", "A máquina vai ligar e centrifugar: ${describeTime(model)}.") {
-                WasherController.spinNow(selectedTime, selectedSpeed) { toast(it) }
+        val spinLabel = if (model.hasSpinOnlyProgram) "Centrifugar" else "Centrifugar (experimental)"
+        fun spin(n: Int) = List(n) { i -> Step(if (n == 1) spinLabel else "$spinLabel ${i + 1}/$n", spinOnly = true, spinSpeed = selectedSpeed) }
+        sp.button(spinLabel) { askStart(spinLabel, spin(1)) }
+        sp.button("$spinLabel 2 vezes") { askStart("$spinLabel 2 vezes", spin(2)) }
+        sp.button("$spinLabel 3 vezes") { askStart("$spinLabel 3 vezes", spin(3)) }
+        model.rinseSpinProgram?.let { rinse ->
+            val rinseStep = { Step("Enxágue + centrifugação", spinOnly = false, program = rinse, spinSpeed = selectedSpeed) }
+            sp.button("Enxágue + centrifugação") { askStart("Enxágue + centrifugação", listOf(rinseStep())) }
+            sp.button("Enxágue + centrifugação + centrifugar de novo") {
+                askStart("Enxágue + centrifugação + centrifugar de novo", listOf(rinseStep()) + spin(1).map { it.copy(label = "Centrifugação extra") })
             }
-        }
-        spin.button("Iniciar o programa escolhido no painel com esta centrifugação", primary = false) {
-            val prog = WasherController.status?.programName ?: "atual"
-            confirm("Iniciar programa $prog?", "A lavagem completa começa com centrifugação: ${describeTime(model)}.") {
-                WasherController.startProgramBoosted(selectedTime, selectedSpeed) { toast(it) }
-            }
-        }
-        if (!model.hasSpinOnlyProgram) {
-            spin.text(
-                "Sua máquina não tem um programa \"só centrifugar\" no protocolo. O app tenta zerar lavagem e " +
-                    "enxágue e deixar só a centrifugação. Fique de olho na primeira vez.",
-                12f, color = "#AA6600",
+            sp.text(
+                "Para o enxágue com amaciante, coloque amaciante no compartimento antes de começar.",
+                12f, color = "#666666",
             )
         }
-
-        // ---- automation
-        val auto = root.card("Centrifugação extra automática")
-        auto.text(
-            "Quando o ciclo terminar, o app manda a máquina centrifugar de novo com as configurações acima. " +
-                "Deixe o app conectado (pode bloquear a tela).",
-            13f, color = "#666666",
-        )
-        auto.text("Quantas vezes", 13f, color = "#666666")
-        auto.spinner(listOf("1 vez", "2 vezes", "3 vezes"), selectedRepeats - 1) { selectedRepeats = it + 1 }
-        autoSwitch = Switch(this).apply {
-            text = "Ativar"
-            textSize = 16f
-            isChecked = WasherController.autoEnabled
-            setOnCheckedChangeListener { _, checked ->
-                if (checked != WasherController.autoEnabled) {
-                    WasherController.setAutomation(checked, selectedRepeats, selectedTime, selectedSpeed)
-                }
-            }
+        if (model == FrontLoadWasher) {
+            sp.text("Nesta máquina cada centrifugação dura cerca de 10 min (tempo fixo do programa).", 12f, color = "#666666")
         }
-        auto.addView(autoSwitch, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8) })
-        autoStatusText = auto.text("", 14f, color = "#1565C0")
+
+        // ---- program catalog
+        val pc = root.card("Programas")
+        pc.text(
+            "✓ = já visto na sua máquina · ✗ = a máquina recusou. Com o app aberto, gire o seletor do painel " +
+                "pelos programas para o app aprender quais existem.",
+            12f, color = "#666666",
+        )
+        programsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        pc.addView(programsBox)
+        renderPrograms(model)
+
+        // ---- extra spins after a cycle started on the panel
+        val fc = root.card("Ciclo iniciado no painel")
+        fc.text("Quando o ciclo que você iniciou no painel terminar, centrifugar mais:", 13f, color = "#666666")
+        fc.spinner(listOf("1 vez", "2 vezes", "3 vezes"), followRepeats - 1) { followRepeats = it + 1 }
+        fc.button("Armar centrifugação extra", primary = false) {
+            val steps = List(followRepeats) { i -> Step("Centrifugação extra ${i + 1}/$followRepeats", spinOnly = true, spinSpeed = selectedSpeed) }
+            WasherController.followCurrentCycle("Centrifugação extra", steps)
+            toast("Armado: o app centrifuga quando o ciclo terminar")
+        }
 
         // ---- basic controls
         val ctl = root.card("Controles")
@@ -299,11 +284,10 @@ class MainActivity : Activity() {
         }
         rowButton("Ligar") { WasherController.power(true) { toast(it) } }
         rowButton("Pausar") { WasherController.pause { toast(it) } }
-        rowButton("Desligar") { confirm("Desligar a máquina?", "O ciclo atual será interrompido.") { WasherController.power(false) { toast(it) } } }
+        rowButton("Desligar") { confirm("Desligar a máquina?", "O ciclo atual e a sequência serão interrompidos.") { WasherController.power(false) { toast(it) } } }
         ctl.addView(row)
         ctl.text(
-            "Se a máquina não obedecer, ative o controle remoto/Wi-Fi no painel dela (em muitos modelos é " +
-                "segurar o botão de Wi-Fi por 3 s).",
+            "Antes de iniciar pelo app, ative o controle remoto (Wi-Fi) no painel da máquina.",
             12f, color = "#666666",
         )
 
@@ -330,27 +314,78 @@ class MainActivity : Activity() {
         renderStatus()
     }
 
-    private fun describeTime(model: WasherModel): String {
-        if (model.spinTimeUnit != "nível") return "$selectedTime ${model.spinTimeUnit}"
-        return when (val m = WasherController.spinLevels()[selectedTime]) {
-            null -> "nível $selectedTime (minutos ainda desconhecidos)"
-            -1 -> "nível $selectedTime (a máquina recusou este nível)"
-            else -> "nível $selectedTime = $m min"
+    /** Program grid, two per row; machine-confirmed programs first. Rebuilt only when what we know changes. */
+    private fun renderPrograms(model: WasherModel) {
+        val box = programsBox ?: return
+        val seen = Programs.seen(this) + Programs.worked(this)
+        val failed = Programs.failed(this)
+        val signature = "$seen|$failed"
+        if (signature == programsSignature) return
+        programsSignature = signature
+
+        val catalog = model.programs.toMutableList()
+        // Programs reported by the machine that are not in the catalog.
+        seen.filter { code -> catalog.none { it.code == code } && code != model.spinOnlyProgram && code != model.rinseSpinProgram }
+            .forEach { catalog.add(com.centrifugamais.midea.Option(it, model.programName(it))) }
+        val ordered = catalog.sortedBy { if (it.code in seen) 0 else if (it.code in failed) 2 else 1 }
+
+        box.removeAllViews()
+        ordered.chunked(2).forEach { pair ->
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            pair.forEach { opt ->
+                val mark = when (opt.code) { in seen -> " ✓"; in failed -> " ✗"; else -> "" }
+                row.addView(Button(this).apply {
+                    text = opt.label + mark
+                    isAllCaps = false
+                    textSize = 14f
+                    alpha = if (opt.code in failed) 0.5f else 1f
+                    setOnClickListener { showProgramDialog(model, opt.code, opt.label) }
+                }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            }
+            if (pair.size == 1) row.addView(View(this), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            box.addView(row)
         }
     }
 
-    private fun updateTimeLabel(model: WasherModel) {
-        val label = timeLabel ?: return
-        var text = "Tempo de centrifugação: ${describeTime(model)}"
-        if (model.spinTimeUnit == "nível") {
-            val known = WasherController.spinLevels().toSortedMap()
-            text += "\nA máquina usa níveis, não minutos. O app aprende quantos minutos cada nível dá " +
-                "quando você usa." +
-                if (known.isEmpty()) "" else "\nJá conhecidos: " + known.entries.joinToString(" · ") {
-                    if (it.value < 0) "${it.key} = recusado" else "${it.key} = ${it.value} min"
-                }
+    private fun showProgramDialog(model: WasherModel, program: Int, name: String) {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
         }
-        label.text = text
+        var temp: Int? = null
+        if (model.temperatures.isNotEmpty()) {
+            box.text("Temperatura", 13f, color = "#666666")
+            box.spinner(listOf("Padrão do programa") + model.temperatures.map { it.label }, 0) {
+                temp = if (it == 0) null else model.temperatures[it - 1].code
+            }
+        }
+        var speed: Int? = null
+        box.text("Velocidade da centrifugação", 13f, color = "#666666")
+        box.spinner(listOf("Padrão do programa") + model.spinSpeeds.map { it.label }, 0) {
+            speed = if (it == 0) null else model.spinSpeeds[it - 1].code
+        }
+        var extra = 0
+        box.text("Centrifugação extra no final", 13f, color = "#666666")
+        box.spinner(listOf("Nenhuma", "+1 centrifugação", "+2 centrifugações"), 0) { extra = it }
+
+        AlertDialog.Builder(this)
+            .setTitle(name)
+            .setView(box)
+            .setPositiveButton("Iniciar") { _, _ ->
+                val steps = listOf(Step(name, spinOnly = false, program = program, spinSpeed = speed, temperature = temp)) +
+                    List(extra) { i -> Step("Centrifugação extra ${i + 1}/$extra", spinOnly = true, spinSpeed = selectedSpeed) }
+                val title = if (extra > 0) "$name + $extra centrifugação(ões)" else name
+                WasherController.runSequence(title, steps) { toast(it) }
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    private fun askStart(title: String, steps: List<Step>) {
+        val desc = steps.joinToString(" → ") { it.label }
+        confirm("$title?", "A máquina vai ligar e fazer: $desc.") {
+            WasherController.runSequence(title, steps) { toast(it) }
+        }
     }
 
     private fun confirm(title: String, msg: String, action: () -> Unit) {
@@ -378,14 +413,19 @@ class MainActivity : Activity() {
                 appendLine("Programa: ${s.programName}")
                 appendLine("Etapa: ${s.stageName}")
                 if (s.running && s.timeRemainingMin != null) appendLine("Tempo restante: ${s.timeRemainingMin} min")
-                val minutes = s.spinMinutes?.let { "$it min (nível ${s.spinTimeValue})" } ?: "tempo ${s.spinTimeValue}"
-                appendLine("Centrifugação: ${s.spinSpeedName}, $minutes")
+                val minutes = s.spinMinutes?.let { ", $it min" } ?: ""
+                appendLine("Centrifugação: ${s.spinSpeedName}$minutes")
                 if (s.errorCode != 0) appendLine("Código de erro: ${s.errorCode}")
             }.trimEnd()
         }
-        autoStatusText?.text = c.autoText
-        autoSwitch?.let { if (it.isChecked != c.autoEnabled) it.isChecked = c.autoEnabled }
+        val title = c.planTitle
+        planText?.text = when {
+            c.planText.isEmpty() -> ""
+            title.isEmpty() -> c.planText
+            else -> "Sequência \"$title\"\n${c.planText}"
+        }
+        cancelPlanButton?.visibility = if (c.planActive) View.VISIBLE else View.GONE
         logText?.text = c.logText().lines().takeLast(25).joinToString("\n")
-        c.model?.let { updateTimeLabel(it) }
+        c.model?.let { renderPrograms(it) }
     }
 }

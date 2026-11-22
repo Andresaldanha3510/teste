@@ -16,9 +16,19 @@ import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
+/** One cycle of a sequence: a program (or the spin-only cycle) with its settings. */
+data class Step(
+    val label: String,
+    val spinOnly: Boolean,
+    val program: Int = 0,
+    val spinSpeed: Int? = null,
+    val temperature: Int? = null,
+)
+
 /**
- * Keeps one connection to the washer, polls its status and runs the
- * "extra spin" automation. All public methods are safe to call from the UI thread.
+ * Keeps one connection to the washer, polls its status and runs sequences of
+ * cycles ("lavar, depois centrifugar de novo…"). Public methods are safe to call
+ * from the UI thread.
  */
 object WasherController {
 
@@ -29,14 +39,13 @@ object WasherController {
     @Volatile var device: SavedDevice? = null; private set
     val model: WasherModel? get() = device?.let { WasherModel.forType(it.type) }
 
-    // Automation ("centrifugar de novo quando o ciclo terminar")
-    @Volatile var autoEnabled = false; private set
-    @Volatile var autoRepeatsLeft = 0; private set
-    @Volatile var autoText = ""; private set
-    @Volatile private var autoSpinTime = 0
-    @Volatile private var autoSpinSpeed = 0
+    // Sequence: the steps still to run after the current cycle ends.
+    private val pending = ArrayDeque<Step>()
+    @Volatile var planTitle = ""; private set
+    @Volatile var planText = ""; private set
     @Volatile private var sawRunning = false
-    @Volatile private var autoPending = false
+    @Volatile private var stepScheduled = false
+    val planActive: Boolean get() = synchronized(pending) { pending.isNotEmpty() } || stepScheduled
 
     private val logLines = ArrayDeque<String>()
     private val listeners = LinkedHashSet<() -> Unit>()
@@ -95,7 +104,7 @@ object WasherController {
         conn = Conn.DISCONNECTED
         status = null
         device = null
-        setAutomation(false, 0, 0, 0)
+        cancelPlan(silent = true)
         if (!keepService) context.stopService(Intent(context, WasherService::class.java))
         notifyListeners()
     }
@@ -175,9 +184,9 @@ object WasherController {
             log("Status: ${s.statusText} · ${s.programName} · ${s.stageName} · raw=$hex")
         }
         status = s
-        // Whatever level the machine reports together with its minutes is valid.
-        s.spinMinutes?.let { if (s.spinTimeValue in 1..15 && it in 1..120) learn(s.spinTimeValue, it) }
-        onStatusForAutomation(s)
+        // Any program the machine reports while on exists on this machine.
+        if (s.power) appContext?.let { Programs.markSeen(it, s.programCode) }
+        onStatusForPlan(s)
         notifyListeners()
     }
 
@@ -219,84 +228,149 @@ object WasherController {
         }
     }
 
-    private fun ensureReadyToStart(): WasherStatus {
-        val m = model ?: throw Exception("Modelo desconhecido")
-        if (connection == null) throw Exception("Sem conexão com a lavadora")
-        var s = status
-        if (s == null && !waitFor(5000) { true }) throw Exception("A máquina não respondeu ao pedido de status")
-        s = status!!
-        if (s.running) throw Exception("A máquina já está funcionando. Pause ou espere terminar.")
-        if (s.paused) {
-            throw Exception(
-                "A máquina está pausada. Pausada, ela só retoma o ciclo antigo e ignora velocidade e tempo " +
-                    "novos. Toque em Desligar (ou cancele no painel) e tente de novo.",
-            )
-        }
-        if (!s.power) {
-            send(m.powerBody(true))
-            if (!waitFor(8000) { it.power }) throw Exception("A máquina não ligou pelo app")
-            Thread.sleep(1500)
-        }
-        return status!!
-    }
-
-    private fun startAndConfirm(body: ByteArray, requestedLevel: Int): String {
-        send(body)
-        // The machine takes ~10 s to report that it started (seen on a real 0xDB).
-        if (!waitFor(25_000) { it.running }) {
-            logCurrentStatus()
-            return "Comando enviado, mas a máquina não começou. Confira se a porta/tampa está fechada e se o " +
-                "controle remoto (Wi-Fi) está ativado no painel."
-        }
-        // Give the machine a moment to report the settings it actually applied.
-        Thread.sleep(2000)
-        val s = status ?: return "A máquina começou! ✔"
-        val minutes = s.spinMinutes?.let { " = $it min" } ?: ""
-        return if (s.spinTimeValue == requestedLevel) {
-            s.spinMinutes?.let { learn(requestedLevel, it) }
-            "A máquina começou! ✔ Centrifugação nível ${s.spinTimeValue}$minutes"
-        } else {
-            // Not recorded as "refused": the same level may work in another program
-            // (the spin-only program seems to use a fixed time).
-            "A máquina começou, mas neste programa ignorou o tempo $requestedLevel e usou o nível " +
-                "${s.spinTimeValue}$minutes."
-        }
-    }
-
     private fun logCurrentStatus() {
         val s = status ?: return log("Sem status da máquina")
         log("Status atual: ${s.statusText} · ${s.programName} · raw=${s.rawBody.toHex()}")
     }
 
-    /** Remembers how many minutes a spin-time level gives on this machine (-1 = refused). */
-    private fun learn(level: Int, minutes: Int) {
-        val ctx = appContext ?: return
-        val prefs = Prefs(ctx)
-        val known = prefs.spinLevels.toMutableMap()
-        if (known[level] == minutes) return
-        known[level] = minutes
-        prefs.spinLevels = known
-        log(if (minutes < 0) "Aprendi: nível $level não é aceito" else "Aprendi: nível $level = $minutes min")
+    private fun ensureReadyToStart(): WasherStatus {
+        val m = model ?: throw Exception("Modelo desconhecido")
+        if (connection == null) throw Exception("Sem conexão com a lavadora")
+        if (status == null && !waitFor(5000) { true }) throw Exception("A máquina não respondeu ao pedido de status")
+        val s = status!!
+        if (s.running) throw Exception("A máquina já está funcionando. Pause ou espere terminar.")
+        if (s.paused) {
+            throw Exception(
+                "A máquina está pausada. Pausada, ela só retoma o ciclo antigo e ignora configurações " +
+                    "novas. Toque em Desligar (ou cancele no painel) e tente de novo.",
+            )
+        }
+        if (!s.power) {
+            send(m.powerBody(true))
+            if (!waitFor(10_000) { it.power }) throw Exception("A máquina não ligou pelo app")
+            Thread.sleep(1500)
+        }
+        return status!!
     }
 
-    fun spinLevels(): Map<Int, Int> = appContext?.let { Prefs(it).spinLevels } ?: emptyMap()
-
-    fun spinNow(spinTime: Int, spinSpeed: Int, done: (String) -> Unit) = runCommand(done) {
+    /** Starts one step and waits for confirmation. Throws if the machine did not start. */
+    private fun startStep(step: Step): String {
         val m = model ?: throw Exception("Modelo desconhecido")
-        val s = ensureReadyToStart()
-        log("Centrifugar: tempo=$spinTime velocidade=$spinSpeed")
-        startAndConfirm(m.spinOnlyBody(s, spinTime, spinSpeed), spinTime)
+        val ready = ensureReadyToStart()
+        val program = if (step.spinOnly) m.spinOnlyProgram else step.program
+        val body = if (step.spinOnly) {
+            m.spinOnlyBody(ready, step.spinSpeed ?: m.spinSpeeds.last().code)
+        } else {
+            m.programBody(ready, step.program, step.spinSpeed, step.temperature)
+        }
+        log("Iniciando: ${step.label}")
+        send(body)
+        // The machine takes ~10 s to report that it started (seen on a real 0xDB).
+        if (!waitFor(25_000) { it.running }) {
+            logCurrentStatus()
+            program?.let { p ->
+                if (status?.programCode != p) appContext?.let { Programs.markFailed(it, p) }
+            }
+            throw Exception(
+                "A máquina não começou \"${step.label}\". Confira a porta, o controle remoto (Wi-Fi) no " +
+                    "painel e se este programa existe na sua máquina.",
+            )
+        }
+        Thread.sleep(2000)
+        val s = status
+        if (program != null && s != null && s.programCode != program) {
+            appContext?.let { Programs.markFailed(it, program) }
+            return "A máquina começou, mas com o programa ${s.programName} em vez de ${step.label}."
+        }
+        program?.let { p -> appContext?.let { Programs.markWorked(it, p) } }
+        val minutes = s?.timeRemainingMin?.let { " (≈ $it min)" } ?: ""
+        return "Começou: ${step.label}$minutes ✔"
     }
 
-    fun startProgramBoosted(spinTime: Int, spinSpeed: Int, done: (String) -> Unit) = runCommand(done) {
-        val m = model ?: throw Exception("Modelo desconhecido")
-        val s = ensureReadyToStart()
-        log("Programa ${s.programName} com centrifugação tempo=$spinTime velocidade=$spinSpeed")
-        startAndConfirm(m.startCurrentProgramBody(s, spinTime, spinSpeed), spinTime)
+    /** Starts [steps] now: the first one immediately, the rest each time a cycle ends. */
+    fun runSequence(title: String, steps: List<Step>, done: (String) -> Unit) = runCommand(done) {
+        require(steps.isNotEmpty())
+        cancelPlan(silent = true)
+        val result = startStep(steps.first())
+        if (steps.size > 1) {
+            synchronized(pending) { pending.addAll(steps.drop(1)) }
+            planTitle = title
+            sawRunning = true
+            updatePlanText("Em andamento: ${steps.first().label}.")
+        }
+        result
+    }
+
+    /** Queues [steps] to run after the cycle that is running now (or the next one) ends. */
+    fun followCurrentCycle(title: String, steps: List<Step>) {
+        cancelPlan(silent = true)
+        synchronized(pending) { pending.addAll(steps) }
+        planTitle = title
+        sawRunning = status?.running == true
+        updatePlanText(if (sawRunning) "Aguardando o ciclo atual terminar." else "Aguardando um ciclo começar e terminar.")
+        log("Sequência \"$title\" armada")
+    }
+
+    fun cancelPlan(silent: Boolean = false) {
+        val had = planActive
+        synchronized(pending) { pending.clear() }
+        stepScheduled = false
+        planTitle = ""
+        planText = ""
+        if (had && !silent) log("Sequência cancelada")
+        notifyListeners()
+    }
+
+    private fun updatePlanText(now: String) {
+        val next = synchronized(pending) { pending.toList() }
+        planText = if (next.isEmpty()) now else "$now\nDepois: " + next.joinToString(" → ") { it.label }
+        notifyListeners()
+    }
+
+    private fun onStatusForPlan(s: WasherStatus) {
+        if (stepScheduled || synchronized(pending) { pending.isEmpty() }) return
+        if (s.running) {
+            sawRunning = true
+            return
+        }
+        if (!sawRunning || s.paused) return
+        // The cycle that was running has finished: start the next step in 20 s.
+        sawRunning = false
+        stepScheduled = true
+        val next = synchronized(pending) { pending.first() }
+        updatePlanText("Ciclo terminou. \"${next.label}\" começa em 20 s.")
+        log("Ciclo terminou; próxima etapa: ${next.label}")
+        appContext?.let { WasherService.alert(it, "Ciclo terminou", "\"${next.label}\" começa em 20 s.") }
+        commands.schedule({
+            try {
+                if (!stepScheduled) return@schedule
+                val step = synchronized(pending) { pending.removeFirstOrNull() } ?: return@schedule
+                val result = startStep(step)
+                log("Sequência: $result")
+                sawRunning = status?.running == true
+                stepScheduled = false
+                if (synchronized(pending) { pending.isEmpty() }) {
+                    planText = "Última etapa em andamento: ${step.label}."
+                    planTitle = ""
+                    notifyListeners()
+                } else {
+                    updatePlanText("Em andamento: ${step.label}.")
+                }
+            } catch (e: Exception) {
+                log("Sequência interrompida: ${e.message}")
+                appContext?.let { WasherService.alert(it, "Sequência interrompida", e.message ?: "") }
+                synchronized(pending) { pending.clear() }
+                stepScheduled = false
+                planTitle = ""
+                planText = "Sequência interrompida: ${e.message}"
+                notifyListeners()
+            }
+        }, 20, TimeUnit.SECONDS)
     }
 
     fun power(on: Boolean, done: (String) -> Unit) = runCommand(done) {
         val m = model ?: throw Exception("Modelo desconhecido")
+        if (!on) cancelPlan()
         send(m.powerBody(on))
         if (waitFor(10_000) { it.power == on }) {
             if (on) "Ligada" else "Desligada"
@@ -315,66 +389,5 @@ object WasherController {
             logCurrentStatus()
             "A máquina continuou funcionando (ela recusou a pausa remota)"
         }
-    }
-
-    fun refreshNow() = commands.execute { runCatching { model?.let { send(it.queryBody(), AaFrame.TYPE_QUERY) } } }
-
-    // ---------------------------------------------------------------- automation
-
-    fun setAutomation(enabled: Boolean, repeats: Int, spinTime: Int, spinSpeed: Int) {
-        autoEnabled = enabled
-        autoRepeatsLeft = if (enabled) repeats else 0
-        autoSpinTime = spinTime
-        autoSpinSpeed = spinSpeed
-        autoPending = false
-        sawRunning = status?.running == true
-        autoText = if (enabled) {
-            if (sawRunning) "Aguardando o ciclo atual terminar…" else "Aguardando um ciclo começar e terminar…"
-        } else {
-            ""
-        }
-        notifyListeners()
-    }
-
-    private fun onStatusForAutomation(s: WasherStatus) {
-        if (!autoEnabled || autoRepeatsLeft <= 0 || autoPending) return
-        if (s.running) {
-            if (!sawRunning) {
-                sawRunning = true
-                autoText = "Ciclo em andamento. Centrifugação extra quando terminar (${autoRepeatsLeft}x restante)."
-            }
-            return
-        }
-        if (!sawRunning || s.paused) return
-        // The cycle that was running has finished.
-        sawRunning = false
-        autoPending = true
-        autoText = "Ciclo terminou. Centrifugação extra começa em 20 s…"
-        log(autoText)
-        appContext?.let { WasherService.alert(it, "Ciclo terminou", "Centrifugação extra começa em 20 s.") }
-        commands.schedule({
-            try {
-                if (!autoEnabled) return@schedule
-                val m = model ?: return@schedule
-                val ready = ensureReadyToStart()
-                val result = startAndConfirm(m.spinOnlyBody(ready, autoSpinTime, autoSpinSpeed), autoSpinTime)
-                autoRepeatsLeft--
-                autoText = if (autoRepeatsLeft > 0) {
-                    "Centrifugação extra iniciada. Faltam $autoRepeatsLeft."
-                } else {
-                    "Última centrifugação extra iniciada."
-                }
-                log("Automação: $result")
-                if (status?.running == true) sawRunning = true
-                if (autoRepeatsLeft <= 0) autoEnabled = false
-            } catch (e: Exception) {
-                autoText = "Falhou ao iniciar a centrifugação extra: ${e.message}"
-                log(autoText)
-                appContext?.let { WasherService.alert(it, "Centrifugação extra falhou", e.message ?: "") }
-            } finally {
-                autoPending = false
-                notifyListeners()
-            }
-        }, 20, TimeUnit.SECONDS)
     }
 }

@@ -76,7 +76,7 @@ class WasherService : Service() {
             }
             val text = buildString {
                 s?.timeRemainingMin?.let { if (s.running) append("Faltam $it min. ") }
-                if (c.autoEnabled) append(c.autoText)
+                if (c.planText.isNotEmpty()) append(c.planText.lines().first())
             }.ifEmpty { "Toque para abrir" }
             return Notification.Builder(ctx, CHANNEL_STATUS)
                 .setSmallIcon(android.R.drawable.ic_popup_sync)
