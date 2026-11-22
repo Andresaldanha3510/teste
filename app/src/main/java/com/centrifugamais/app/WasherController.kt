@@ -279,8 +279,21 @@ object WasherController {
         Thread.sleep(2000)
         val s = status
         if (program != null && s != null && s.programCode != program) {
+            // Seen on a real machine: an unknown program code makes it start Cotton
+            // instead. Never leave an unintended wash running.
             appContext?.let { Programs.markFailed(it, program) }
-            return "A máquina começou, mas com o programa ${s.programName} em vez de ${step.label}."
+            val started = s.programName
+            log("Programa errado ($started); cancelando")
+            runCatching { send(m.pauseBody()) }
+            val paused = waitFor(10_000) { !it.running }
+            runCatching { send(m.powerBody(false)) }
+            val off = waitFor(10_000) { !it.power }
+            val what = when {
+                off -> "o app desligou a máquina"
+                paused -> "o app pausou a máquina; cancele no painel"
+                else -> "o app NÃO conseguiu parar: cancele no painel"
+            }
+            throw Exception("Sua máquina não tem \"${step.label}\": ela começou $started no lugar, e $what.")
         }
         program?.let { p -> appContext?.let { Programs.markWorked(it, p) } }
         val minutes = s?.timeRemainingMin?.let { " (≈ $it min)" } ?: ""

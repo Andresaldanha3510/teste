@@ -236,7 +236,15 @@ class MainActivity : Activity() {
         sp.button(spinLabel) { askStart(spinLabel, spin(1)) }
         sp.button("$spinLabel 2 vezes") { askStart("$spinLabel 2 vezes", spin(2)) }
         sp.button("$spinLabel 3 vezes") { askStart("$spinLabel 3 vezes", spin(3)) }
-        model.rinseSpinProgram?.let { rinse ->
+        val rinseMissing = model.rinseSpinProgram?.let { it in Programs.failed(this) } == true
+        if (rinseMissing) {
+            sp.text(
+                "Sua máquina não tem o programa \"Enxágue + centrifugação\" (testado). Se o painel tiver um " +
+                    "programa de enxágue, gire o seletor até ele com o app aberto para o app aprender o código.",
+                12f, color = "#AA6600",
+            )
+        }
+        model.rinseSpinProgram?.takeUnless { rinseMissing }?.let { rinse ->
             val rinseStep = { Step("Enxágue + centrifugação", spinOnly = false, program = rinse, spinSpeed = selectedSpeed) }
             sp.button("Enxágue + centrifugação") { askStart("Enxágue + centrifugação", listOf(rinseStep())) }
             sp.button("Enxágue + centrifugação + centrifugar de novo") {
