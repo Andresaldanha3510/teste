@@ -40,6 +40,16 @@ class Prefs(context: Context) {
         }.toMap()
         set(v) = sp.edit().putString("spinLevels", v.entries.joinToString(",") { "${it.key}:${it.value}" }).apply()
 
+    /**
+     * Version 0.2.0 could wrongly learn "refused" when it resumed a paused cycle;
+     * drop those entries once.
+     */
+    fun migrateSpinLevels() {
+        if (sp.getBoolean("levelsMigrated3", false)) return
+        spinLevels = spinLevels.filterValues { it >= 0 }
+        sp.edit().putBoolean("levelsMigrated3", true).apply()
+    }
+
     var device: SavedDevice?
         get() {
             if (!sp.contains("dev_id")) return null

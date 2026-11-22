@@ -226,6 +226,12 @@ object WasherController {
         if (s == null && !waitFor(5000) { true }) throw Exception("A máquina não respondeu ao pedido de status")
         s = status!!
         if (s.running) throw Exception("A máquina já está funcionando. Pause ou espere terminar.")
+        if (s.paused) {
+            throw Exception(
+                "A máquina está pausada. Pausada, ela só retoma o ciclo antigo e ignora velocidade e tempo " +
+                    "novos. Toque em Desligar (ou cancele no painel) e tente de novo.",
+            )
+        }
         if (!s.power) {
             send(m.powerBody(true))
             if (!waitFor(8000) { it.power }) throw Exception("A máquina não ligou pelo app")
@@ -236,7 +242,9 @@ object WasherController {
 
     private fun startAndConfirm(body: ByteArray, requestedLevel: Int): String {
         send(body)
-        if (!waitFor(10_000) { it.running }) {
+        // The machine takes ~10 s to report that it started (seen on a real 0xDB).
+        if (!waitFor(25_000) { it.running }) {
+            logCurrentStatus()
             return "Comando enviado, mas a máquina não começou. Confira se a porta/tampa está fechada e se o " +
                 "controle remoto (Wi-Fi) está ativado no painel."
         }
@@ -248,9 +256,16 @@ object WasherController {
             s.spinMinutes?.let { learn(requestedLevel, it) }
             "A máquina começou! ✔ Centrifugação nível ${s.spinTimeValue}$minutes"
         } else {
-            if (s.spinMinutes != null) learn(requestedLevel, -1)
-            "A máquina começou, mas não aceitou o tempo $requestedLevel: ficou em ${s.spinTimeValue}$minutes."
+            // Not recorded as "refused": the same level may work in another program
+            // (the spin-only program seems to use a fixed time).
+            "A máquina começou, mas neste programa ignorou o tempo $requestedLevel e usou o nível " +
+                "${s.spinTimeValue}$minutes."
         }
+    }
+
+    private fun logCurrentStatus() {
+        val s = status ?: return log("Sem status da máquina")
+        log("Status atual: ${s.statusText} · ${s.programName} · raw=${s.rawBody.toHex()}")
     }
 
     /** Remembers how many minutes a spin-time level gives on this machine (-1 = refused). */
@@ -283,13 +298,23 @@ object WasherController {
     fun power(on: Boolean, done: (String) -> Unit) = runCommand(done) {
         val m = model ?: throw Exception("Modelo desconhecido")
         send(m.powerBody(on))
-        if (waitFor(8000) { it.power == on }) (if (on) "Ligada" else "Desligada") else "A máquina não respondeu"
+        if (waitFor(10_000) { it.power == on }) {
+            if (on) "Ligada" else "Desligada"
+        } else {
+            logCurrentStatus()
+            "A máquina não obedeceu"
+        }
     }
 
     fun pause(done: (String) -> Unit) = runCommand(done) {
         val m = model ?: throw Exception("Modelo desconhecido")
         send(m.pauseBody())
-        if (waitFor(8000) { !it.running }) "Pausada" else "A máquina não respondeu"
+        if (waitFor(10_000) { !it.running }) {
+            "Pausada"
+        } else {
+            logCurrentStatus()
+            "A máquina continuou funcionando (ela recusou a pausa remota)"
+        }
     }
 
     fun refreshNow() = commands.execute { runCatching { model?.let { send(it.queryBody(), AaFrame.TYPE_QUERY) } } }
