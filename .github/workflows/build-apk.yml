@@ -1,0 +1,44 @@
+name: Gerar APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Testes do protocolo + compilar APK
+        run: ./gradlew --no-daemon :protocol:test :app:assembleDebug
+
+      - name: Renomear APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk Centrifuga-mais.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Centrifuga-mais-apk
+          path: Centrifuga-mais.apk
+
+      - name: Publicar na página de Releases (download direto pelo celular)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.ref_name == 'main' && 'main' || 'dev' }}
+          name: Centrifuga+ (build ${{ github.run_number }})
+          body: |
+            APK gerado automaticamente a partir do commit ${{ github.sha }}.
+            Baixe o arquivo Centrifuga-mais.apk abaixo pelo celular e instale.
+          prerelease: true
+          make_latest: false
+          files: Centrifuga-mais.apk
