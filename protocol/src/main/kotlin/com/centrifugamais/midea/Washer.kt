@@ -14,6 +14,10 @@ data class WasherStatus(
     val spinSpeedCode: Int,
     val spinSpeedName: String,
     val spinTimeValue: Int,
+    /** Spin duration in minutes as reported by the machine, when it reports it. */
+    val spinMinutes: Int?,
+    /** Total cycle time remaining is in [timeRemainingMin]; this is the wash part only. */
+    val washMinutes: Int?,
     val errorCode: Int,
     val rawBody: ByteArray,
 )
@@ -29,6 +33,7 @@ sealed class WasherModel(val deviceType: Int) {
     abstract val spinSpeeds: List<Option>
     abstract val maxSpinTime: Int
     abstract val spinTimeUnit: String
+    abstract val defaultSpinTime: Int
     /** True when the machine has a dedicated spin-only program. */
     abstract val hasSpinOnlyProgram: Boolean
 
@@ -68,6 +73,7 @@ object TopLoadWasher : WasherModel(TYPE_TOP_LOAD) {
     override val spinSpeeds = listOf(Option(1, "Baixa"), Option(2, "Média"), Option(3, "Alta"))
     override val maxSpinTime = 15
     override val spinTimeUnit = "min"
+    override val defaultSpinTime = 9
     override val hasSpinOnlyProgram = false
 
     private val programs = listOf(
@@ -104,6 +110,8 @@ object TopLoadWasher : WasherModel(TYPE_TOP_LOAD) {
             spinSpeedCode = speed,
             spinSpeedName = speeds.getOrElse(speed) { "$speed" },
             spinTimeValue = (body.at(10) and 0xF0) shr 4,
+            spinMinutes = null,
+            washMinutes = null,
             errorCode = body.at(24),
             rawBody = body,
         )
@@ -151,8 +159,11 @@ object FrontLoadWasher : WasherModel(TYPE_FRONT_LOAD) {
         Option(1, "400 rpm"), Option(2, "600 rpm"), Option(3, "800 rpm"), Option(4, "1000 rpm"),
         Option(5, "1200 rpm"), Option(6, "1400 rpm"),
     )
-    override val maxSpinTime = 30
-    override val spinTimeUnit = "min"
+    // The spin-time field is a level, not minutes (confirmed on a real machine:
+    // level 2 = 10 min). The machine reports the real minutes in body[28].
+    override val maxSpinTime = 9
+    override val spinTimeUnit = "nível"
+    override val defaultSpinTime = 2
     override val hasSpinOnlyProgram = true
 
     private const val PROGRAM_SPIN_ONLY = 0x09
@@ -191,6 +202,8 @@ object FrontLoadWasher : WasherModel(TYPE_FRONT_LOAD) {
             spinSpeedCode = speed,
             spinSpeedName = speedNames[speed]?.let { if (it.all(Char::isDigit)) "$it rpm" else it } ?: "padrão",
             spinTimeValue = body.at(10),
+            spinMinutes = if (body.size > 28 && body.u(28) != 0xFF) body.u(28) else null,
+            washMinutes = if (body.size > 27 && body.u(27) != 0xFF) body.u(27) else null,
             errorCode = 0,
             rawBody = body,
         )

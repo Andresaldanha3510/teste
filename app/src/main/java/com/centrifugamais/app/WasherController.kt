@@ -175,6 +175,8 @@ object WasherController {
             log("Status: ${s.statusText} · ${s.programName} · ${s.stageName} · raw=$hex")
         }
         status = s
+        // Whatever level the machine reports together with its minutes is valid.
+        s.spinMinutes?.let { if (s.spinTimeValue in 1..15 && it in 1..120) learn(s.spinTimeValue, it) }
         onStatusForAutomation(s)
         notifyListeners()
     }
@@ -232,28 +234,50 @@ object WasherController {
         return status!!
     }
 
-    private fun startAndConfirm(body: ByteArray): String {
+    private fun startAndConfirm(body: ByteArray, requestedLevel: Int): String {
         send(body)
-        return if (waitFor(10_000) { it.running }) {
-            "A máquina começou! ✔"
-        } else {
-            "Comando enviado, mas a máquina não começou. Confira se a porta/tampa está fechada e se o " +
+        if (!waitFor(10_000) { it.running }) {
+            return "Comando enviado, mas a máquina não começou. Confira se a porta/tampa está fechada e se o " +
                 "controle remoto (Wi-Fi) está ativado no painel."
         }
+        // Give the machine a moment to report the settings it actually applied.
+        Thread.sleep(2000)
+        val s = status ?: return "A máquina começou! ✔"
+        val minutes = s.spinMinutes?.let { " = $it min" } ?: ""
+        return if (s.spinTimeValue == requestedLevel) {
+            s.spinMinutes?.let { learn(requestedLevel, it) }
+            "A máquina começou! ✔ Centrifugação nível ${s.spinTimeValue}$minutes"
+        } else {
+            if (s.spinMinutes != null) learn(requestedLevel, -1)
+            "A máquina começou, mas não aceitou o tempo $requestedLevel: ficou em ${s.spinTimeValue}$minutes."
+        }
     }
+
+    /** Remembers how many minutes a spin-time level gives on this machine (-1 = refused). */
+    private fun learn(level: Int, minutes: Int) {
+        val ctx = appContext ?: return
+        val prefs = Prefs(ctx)
+        val known = prefs.spinLevels.toMutableMap()
+        if (known[level] == minutes) return
+        known[level] = minutes
+        prefs.spinLevels = known
+        log(if (minutes < 0) "Aprendi: nível $level não é aceito" else "Aprendi: nível $level = $minutes min")
+    }
+
+    fun spinLevels(): Map<Int, Int> = appContext?.let { Prefs(it).spinLevels } ?: emptyMap()
 
     fun spinNow(spinTime: Int, spinSpeed: Int, done: (String) -> Unit) = runCommand(done) {
         val m = model ?: throw Exception("Modelo desconhecido")
         val s = ensureReadyToStart()
         log("Centrifugar: tempo=$spinTime velocidade=$spinSpeed")
-        startAndConfirm(m.spinOnlyBody(s, spinTime, spinSpeed))
+        startAndConfirm(m.spinOnlyBody(s, spinTime, spinSpeed), spinTime)
     }
 
     fun startProgramBoosted(spinTime: Int, spinSpeed: Int, done: (String) -> Unit) = runCommand(done) {
         val m = model ?: throw Exception("Modelo desconhecido")
         val s = ensureReadyToStart()
         log("Programa ${s.programName} com centrifugação tempo=$spinTime velocidade=$spinSpeed")
-        startAndConfirm(m.startCurrentProgramBody(s, spinTime, spinSpeed))
+        startAndConfirm(m.startCurrentProgramBody(s, spinTime, spinSpeed), spinTime)
     }
 
     fun power(on: Boolean, done: (String) -> Unit) = runCommand(done) {
@@ -308,7 +332,7 @@ object WasherController {
                 if (!autoEnabled) return@schedule
                 val m = model ?: return@schedule
                 val ready = ensureReadyToStart()
-                val result = startAndConfirm(m.spinOnlyBody(ready, autoSpinTime, autoSpinSpeed))
+                val result = startAndConfirm(m.spinOnlyBody(ready, autoSpinTime, autoSpinSpeed), autoSpinTime)
                 autoRepeatsLeft--
                 autoText = if (autoRepeatsLeft > 0) {
                     "Centrifugação extra iniciada. Faltam $autoRepeatsLeft."

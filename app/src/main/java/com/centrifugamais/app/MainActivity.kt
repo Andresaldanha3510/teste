@@ -222,7 +222,7 @@ class MainActivity : Activity() {
         if (selectedSpeed == 0) selectedSpeed = prefs.spinSpeed.takeIf { s -> model.spinSpeeds.any { it.code == s } }
             ?: model.spinSpeeds.last().code
         if (selectedTime <= 0) selectedTime = prefs.spinTime.takeIf { it in 1..model.maxSpinTime }
-            ?: minOf(10, model.maxSpinTime)
+            ?: model.defaultSpinTime
         spin.text("Velocidade", 13f, color = "#666666")
         spin.spinner(model.spinSpeeds.map { it.label }, model.spinSpeeds.indexOfFirst { it.code == selectedSpeed }) {
             selectedSpeed = model.spinSpeeds[it].code
@@ -246,13 +246,13 @@ class MainActivity : Activity() {
         updateTimeLabel(model)
 
         spin.button("Centrifugar agora" + if (model.hasSpinOnlyProgram) "" else " (experimental)") {
-            confirm("Centrifugar agora?", "A máquina vai ligar e centrifugar por $selectedTime ${model.spinTimeUnit}.") {
+            confirm("Centrifugar agora?", "A máquina vai ligar e centrifugar: ${describeTime(model)}.") {
                 WasherController.spinNow(selectedTime, selectedSpeed) { toast(it) }
             }
         }
         spin.button("Iniciar o programa escolhido no painel com esta centrifugação", primary = false) {
             val prog = WasherController.status?.programName ?: "atual"
-            confirm("Iniciar programa $prog?", "A lavagem completa começa com centrifugação de $selectedTime ${model.spinTimeUnit}.") {
+            confirm("Iniciar programa $prog?", "A lavagem completa começa com centrifugação: ${describeTime(model)}.") {
                 WasherController.startProgramBoosted(selectedTime, selectedSpeed) { toast(it) }
             }
         }
@@ -329,8 +329,27 @@ class MainActivity : Activity() {
         renderStatus()
     }
 
+    private fun describeTime(model: WasherModel): String {
+        if (model.spinTimeUnit != "nível") return "$selectedTime ${model.spinTimeUnit}"
+        return when (val m = WasherController.spinLevels()[selectedTime]) {
+            null -> "nível $selectedTime (minutos ainda desconhecidos)"
+            -1 -> "nível $selectedTime (a máquina recusou este nível)"
+            else -> "nível $selectedTime = $m min"
+        }
+    }
+
     private fun updateTimeLabel(model: WasherModel) {
-        timeLabel?.text = "Tempo de centrifugação: $selectedTime ${model.spinTimeUnit}"
+        val label = timeLabel ?: return
+        var text = "Tempo de centrifugação: ${describeTime(model)}"
+        if (model.spinTimeUnit == "nível") {
+            val known = WasherController.spinLevels().toSortedMap()
+            text += "\nA máquina usa níveis, não minutos. O app aprende quantos minutos cada nível dá " +
+                "quando você usa." +
+                if (known.isEmpty()) "" else "\nJá conhecidos: " + known.entries.joinToString(" · ") {
+                    if (it.value < 0) "${it.key} = recusado" else "${it.key} = ${it.value} min"
+                }
+        }
+        label.text = text
     }
 
     private fun confirm(title: String, msg: String, action: () -> Unit) {
@@ -358,12 +377,14 @@ class MainActivity : Activity() {
                 appendLine("Programa: ${s.programName}")
                 appendLine("Etapa: ${s.stageName}")
                 if (s.running && s.timeRemainingMin != null) appendLine("Tempo restante: ${s.timeRemainingMin} min")
-                appendLine("Centrifugação: ${s.spinSpeedName}, tempo ${s.spinTimeValue}")
+                val minutes = s.spinMinutes?.let { "$it min (nível ${s.spinTimeValue})" } ?: "tempo ${s.spinTimeValue}"
+                appendLine("Centrifugação: ${s.spinSpeedName}, $minutes")
                 if (s.errorCode != 0) appendLine("Código de erro: ${s.errorCode}")
             }.trimEnd()
         }
         autoStatusText?.text = c.autoText
         autoSwitch?.let { if (it.isChecked != c.autoEnabled) it.isChecked = c.autoEnabled }
         logText?.text = c.logText().lines().takeLast(25).joinToString("\n")
+        c.model?.let { updateTimeLabel(it) }
     }
 }
